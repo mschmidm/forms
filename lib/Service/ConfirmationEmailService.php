@@ -9,8 +9,11 @@ declare(strict_types=1);
 namespace OCA\Forms\Service;
 
 use OCA\Forms\BackgroundJob\SendConfirmationMailJob;
+use OCA\Forms\Constants;
 use OCA\Forms\Db\AnswerMapper;
 use OCA\Forms\Db\Form;
+use OCA\Forms\Db\Option;
+use OCA\Forms\Db\OptionMapper;
 use OCA\Forms\Db\Question;
 use OCA\Forms\Db\QuestionMapper;
 use OCA\Forms\Db\Submission;
@@ -26,12 +29,16 @@ use Psr\Log\LoggerInterface;
 class ConfirmationEmailService {
 	private const RATE_LIMIT_TTL = 86400; // 24 hours
 
+	/** Shown when an answer has no resolvable value */
+	private const EMPTY_ANSWER = '—';
+
 	private readonly ICache $rateLimitCache;
 
 	public function __construct(
 		private readonly ConfigService $configService,
 		private readonly AnswerMapper $answerMapper,
 		private readonly QuestionMapper $questionMapper,
+		private readonly OptionMapper $optionMapper,
 		private readonly IEmailValidator $emailValidator,
 		private readonly IJobList $jobList,
 		ICacheFactory $cacheFactory,
@@ -142,19 +149,20 @@ class ConfirmationEmailService {
 	}
 
 	/**
-	 * @return array<int, string[]>
+	 * @return array<int, list<string>>
 	 */
 	private function buildAnswerMap(Submission $submission): array {
 		$map = [];
 		foreach ($this->answerMapper->findBySubmission($submission->getId()) as $answer) {
-			$map[$answer->getQuestionId()][] = $answer->getText();
+			// The answer text column is nullable, therefore cast like Answer::read()
+			$map[$answer->getQuestionId()][] = (string)$answer->getText();
 		}
 		return $map;
 	}
 
 	/**
 	 * @param list<array<string, mixed>> $questions
-	 * @param array<int, string[]> $answerMap
+	 * @param array<int, list<string>> $answerMap
 	 * @return array{string, string}
 	 */
 	private function buildEmailContent(Form $form, array $questions, array $answerMap): array {
@@ -176,7 +184,8 @@ class ConfirmationEmailService {
 		foreach ($questions as $question) {
 			$fieldKey = !empty($question['name'] ?? '') ? $question['name'] : ($question['text'] ?? '');
 			$fieldKey = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $fieldKey));
-			if ($fieldKey === '' || empty($answerMap[$question['id']])) {
+			$answers = $answerMap[$question['id']] ?? [];
+			if ($fieldKey === '' || $answers === []) {
 				continue;
 			}
 			$placeholder = '{' . $fieldKey . '}';
@@ -187,13 +196,166 @@ class ConfirmationEmailService {
 				]);
 				continue;
 			}
-			$replacements[$placeholder] = implode('; ', $answerMap[$question['id']]);
+			$replacements[$placeholder] = implode('; ', $this->formatAnswer($question, $answers));
 		}
 
 		return [
-			str_replace(array_keys($replacements), array_values($replacements), $subject),
-			str_replace(array_keys($replacements), array_values($replacements), $body),
+			$this->replacePlaceholders($subject, $replacements),
+			$this->replacePlaceholders($body, $replacements),
 		];
+	}
+
+	/**
+	 * Replace every known placeholder, leaving unknown ones untouched
+	 *
+	 * @param array<string, string> $replacements
+	 */
+	private function replacePlaceholders(string $text, array $replacements): string {
+		// One non-recursive pass, so a placeholder a respondent typed into their own
+		// answer stays literal instead of being expanded
+		return preg_replace_callback(
+			'/\{[A-Za-z0-9]+\}/',
+			static fn (array $matches): string => $replacements[$matches[0]] ?? $matches[0],
+			$text
+		) ?? $text;
+	}
+
+	/**
+	 * Render one answer as the lines it occupies, one line per row for a grid
+	 *
+	 * @param array<string, mixed> $question
+	 * @param list<string> $answers
+	 * @return list<string>
+	 */
+	private function formatAnswer(array $question, array $answers): array {
+		// Grid and ranking answers are stored as JSON of option ids, so they need resolving
+		return match ($question['type'] ?? '') {
+			Constants::ANSWER_TYPE_GRID => $this->formatGridRows($question, (string)reset($answers)),
+			Constants::ANSWER_TYPE_RANKING => [$this->formatRanking($question, (string)reset($answers))],
+			default => [implode('; ', $answers)],
+		};
+	}
+
+	/**
+	 * Render a grid answer as one "row label: value" line per row
+	 *
+	 * @param array<string, mixed> $question
+	 * @return list<string>
+	 */
+	private function formatGridRows(array $question, string $answerText): array {
+		$cells = json_decode($answerText, true);
+		if (!is_array($cells)) {
+			return [self::EMPTY_ANSWER];
+		}
+
+		$extraSettings = (array)($question['extraSettings'] ?? []);
+		$cellType = $extraSettings['questionType'] ?? null;
+
+		$options = $this->loadOptions((int)$question['id']);
+		$optionTexts = $this->optionTexts($options);
+		$rows = array_filter($options, static fn (Option $o): bool => $o->getOptionType() === Option::OPTION_TYPE_ROW);
+		$columns = array_filter($options, static fn (Option $o): bool => $o->getOptionType() === Option::OPTION_TYPE_COLUMN);
+
+		$lines = [];
+		foreach ($rows as $row) {
+			$cell = $cells[$row->getId()] ?? null;
+
+			$value = match ($cellType) {
+				Constants::ANSWER_GRID_TYPE_NUMBER => $this->formatGridNumbers((array)$cell, $columns),
+				// Radio holds a single option id, checkbox a list of them
+				default => implode('; ', $this->optionLabels((array)$cell, $optionTexts)),
+			};
+
+			$lines[] = trim((string)$row->getText()) . ': ' . ($value === '' ? self::EMPTY_ANSWER : $value);
+		}
+
+		return $lines === [] ? [self::EMPTY_ANSWER] : $lines;
+	}
+
+	/**
+	 * @param array<mixed> $cell numbers keyed by column id
+	 * @param array<Option> $columns
+	 */
+	private function formatGridNumbers(array $cell, array $columns): string {
+		$pairs = [];
+		foreach ($columns as $column) {
+			$value = $cell[$column->getId()] ?? null;
+			if (!is_scalar($value) || trim((string)$value) === '') {
+				continue;
+			}
+			$pairs[] = trim((string)$column->getText()) . ': ' . trim((string)$value);
+		}
+		return implode('; ', $pairs);
+	}
+
+	/**
+	 * Render a ranking answer as "1. first, 2. second", in the respondent's order
+	 *
+	 * @param array<string, mixed> $question
+	 */
+	private function formatRanking(array $question, string $answerText): string {
+		$rankedIds = json_decode($answerText, true);
+		if (!is_array($rankedIds)) {
+			return self::EMPTY_ANSWER;
+		}
+
+		$optionTexts = $this->optionTexts($this->loadOptions((int)$question['id']));
+
+		$parts = [];
+		foreach (array_values($rankedIds) as $position => $optionId) {
+			// Number by the respondent's own position, so a since-deleted option
+			// leaves a gap instead of silently promoting everything below it
+			foreach ($this->optionLabels([$optionId], $optionTexts) as $label) {
+				$parts[] = ($position + 1) . '. ' . $label;
+			}
+		}
+
+		return $parts === [] ? self::EMPTY_ANSWER : implode(', ', $parts);
+	}
+
+	/**
+	 * Map option ids to their labels, skipping ids that no longer resolve
+	 *
+	 * @param array<mixed> $optionIds
+	 * @param array<int, string> $optionTexts
+	 * @return list<string>
+	 */
+	private function optionLabels(array $optionIds, array $optionTexts): array {
+		$labels = [];
+		foreach ($optionIds as $optionId) {
+			// A malformed answer may hold an unusable array key; '' rather than empty() keeps a label of "0"
+			if ((is_int($optionId) || is_string($optionId)) && ($optionTexts[$optionId] ?? '') !== '') {
+				$labels[] = $optionTexts[$optionId];
+			}
+		}
+		return $labels;
+	}
+
+	/**
+	 * @param array<Option> $options
+	 * @return array<int, string>
+	 */
+	private function optionTexts(array $options): array {
+		$texts = [];
+		foreach ($options as $option) {
+			$texts[$option->getId()] = trim((string)$option->getText());
+		}
+		return $texts;
+	}
+
+	/**
+	 * @return array<Option>
+	 */
+	private function loadOptions(int $questionId): array {
+		try {
+			return $this->optionMapper->findByQuestion($questionId);
+		} catch (\Exception $e) {
+			$this->logger->debug('Failed to load options for confirmation email submission summary', [
+				'questionId' => $questionId,
+				'exception' => $e,
+			]);
+			return [];
+		}
 	}
 
 	/**

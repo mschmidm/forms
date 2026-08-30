@@ -13,6 +13,8 @@ use OCA\Forms\Constants;
 use OCA\Forms\Db\Answer;
 use OCA\Forms\Db\AnswerMapper;
 use OCA\Forms\Db\Form;
+use OCA\Forms\Db\Option;
+use OCA\Forms\Db\OptionMapper;
 use OCA\Forms\Db\Question;
 use OCA\Forms\Db\QuestionMapper;
 use OCA\Forms\Db\Submission;
@@ -42,6 +44,9 @@ class ConfirmationEmailServiceTest extends TestCase {
 	/** @var QuestionMapper|MockObject */
 	private $questionMapper;
 
+	/** @var OptionMapper|MockObject */
+	private $optionMapper;
+
 	/** @var IEmailValidator|MockObject */
 	private $emailValidator;
 
@@ -66,6 +71,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 		$this->configService = $this->createMock(ConfigService::class);
 		$this->answerMapper = $this->createMock(AnswerMapper::class);
 		$this->questionMapper = $this->createMock(QuestionMapper::class);
+		$this->optionMapper = $this->createMock(OptionMapper::class);
 		$this->emailValidator = $this->createMock(IEmailValidator::class);
 		$this->jobList = $this->createMock(IJobList::class);
 		$this->cacheFactory = $this->createMock(ICacheFactory::class);
@@ -85,6 +91,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			$this->configService,
 			$this->answerMapper,
 			$this->questionMapper,
+			$this->optionMapper,
 			$this->emailValidator,
 			$this->jobList,
 			$this->cacheFactory,
@@ -99,12 +106,79 @@ class ConfirmationEmailServiceTest extends TestCase {
 		return $entity;
 	}
 
-	private function makeEmailAnswer(int $submissionId, int $questionId, string $email): Answer {
+	private function makeAnswer(int $questionId, string $text, int $submissionId = 10): Answer {
 		$answer = new Answer();
 		$answer->setSubmissionId($submissionId);
 		$answer->setQuestionId($questionId);
-		$answer->setText($email);
+		$answer->setText($text);
 		return $answer;
+	}
+
+	private function createOption(int $id, string $text, string $optionType = ''): Option {
+		$option = new Option();
+		$option->setId($id);
+		$option->setText($text);
+		$option->setOptionType($optionType);
+		return $option;
+	}
+
+	private function emailQuestion(): MockObject {
+		return $this->createQuestionEntity([
+			'id' => 5,
+			'type' => Constants::ANSWER_TYPE_SHORT,
+			'text' => 'Email',
+			'name' => 'email',
+			'extraSettings' => ['validationType' => 'email'],
+		]);
+	}
+
+	/**
+	 * Configure the mocks for a form that does send a confirmation email and
+	 * return the payload of the queued job.
+	 *
+	 * @param list<MockObject> $questions
+	 * @param list<Answer> $answers
+	 * @param array<int, list<Option>> $optionsByQuestion
+	 * @return array{recipient: string, subject: string, body: string, formId: int, submissionId: int}
+	 */
+	private function queueAndCapture(
+		array $questions,
+		array $answers,
+		string $body = 'Thanks',
+		string $subject = 'Received',
+		array $optionsByQuestion = [],
+	): array {
+		$form = Form::fromParams([
+			'id' => 1,
+			'title' => 'Survey',
+			'confirmationEmailEnabled' => true,
+			'confirmationEmailQuestionId' => 5,
+			'confirmationEmailSubject' => $subject,
+			'confirmationEmailBody' => $body,
+		]);
+		$submission = new Submission();
+		$submission->setId(10);
+
+		$this->configService->method('getAllowConfirmationEmail')->willReturn(true);
+		$this->configService->method('getConfirmationEmailRateLimit')->willReturn(3);
+		$this->questionMapper->method('findByForm')->willReturn($questions);
+		$this->answerMapper->method('findBySubmission')->willReturn($answers);
+		$this->optionMapper->method('findByQuestion')
+			->willReturnCallback(fn ($questionId, $optionType = null): array => $optionsByQuestion[$questionId] ?? []);
+		$this->emailValidator->method('isValid')->willReturn(true);
+		$this->cache->method('add')->willReturn(true);
+
+		$captured = null;
+		$this->jobList->expects($this->once())
+			->method('add')
+			->willReturnCallback(function ($job, $payload) use (&$captured): void {
+				$captured = $payload;
+			});
+
+		$this->service->send($form, $submission);
+
+		$this->assertIsArray($captured, 'No confirmation email was queued');
+		return $captured;
 	}
 
 	public function testSendDoesNothingIfConfirmationEmailDisabled(): void {
@@ -203,7 +277,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			]),
 		]);
 		$this->answerMapper->method('findBySubmission')->willReturn([
-			$this->makeEmailAnswer(10, 5, 'not-an-email'),
+			$this->makeAnswer(5, 'not-an-email'),
 		]);
 		$this->emailValidator->method('isValid')->with('not-an-email')->willReturn(false);
 		$this->jobList->expects($this->never())->method('add');
@@ -231,7 +305,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			]),
 		]);
 		$this->answerMapper->method('findBySubmission')->willReturn([
-			$this->makeEmailAnswer(10, 5, 'user@example.com'),
+			$this->makeAnswer(5, 'user@example.com'),
 		]);
 		$this->emailValidator->method('isValid')->with('user@example.com')->willReturn(true);
 
@@ -289,7 +363,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 		$nameAnswer->setQuestionId(3);
 		$nameAnswer->setText('Alice');
 
-		$emailAnswer = $this->makeEmailAnswer(10, 5, 'alice@example.com');
+		$emailAnswer = $this->makeAnswer(5, 'alice@example.com');
 
 		$this->answerMapper->method('findBySubmission')->willReturn([$nameAnswer, $emailAnswer]);
 		$this->emailValidator->method('isValid')->willReturn(true);
@@ -308,6 +382,230 @@ class ConfirmationEmailServiceTest extends TestCase {
 			);
 
 		$this->service->send($form, $submission);
+	}
+
+	private function gridQuestion(int $id, string $text, string $name, string $cellType): MockObject {
+		return $this->createQuestionEntity([
+			'id' => $id,
+			'type' => Constants::ANSWER_TYPE_GRID,
+			'text' => $text,
+			'name' => $name,
+			'extraSettings' => ['questionType' => $cellType],
+		]);
+	}
+
+	public function testSendResolvesGridOptionLabelsInFieldPlaceholders(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->gridQuestion(7, 'Rate these', 'rate', Constants::ANSWER_GRID_TYPE_RADIO),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				// Stored as JSON of option ids: row 21 -> column 25, row 22 -> column 26
+				$this->makeAnswer(7, json_encode([21 => 25, 22 => 26])),
+			],
+			'Rating: {rate}',
+			optionsByQuestion: [
+				7 => [
+					$this->createOption(21, 'Speed', Option::OPTION_TYPE_ROW),
+					$this->createOption(22, 'Price', Option::OPTION_TYPE_ROW),
+					$this->createOption(25, 'Good', Option::OPTION_TYPE_COLUMN),
+					$this->createOption(26, 'Fair', Option::OPTION_TYPE_COLUMN),
+				],
+			],
+		);
+
+		// Must not emit the raw stored JSON of option ids
+		$this->assertSame('Rating: Speed: Good; Price: Fair', $payload['body']);
+	}
+
+	public function testSendResolvesCheckboxAndNumberGridCells(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->gridQuestion(7, 'Pick any', 'pick', Constants::ANSWER_GRID_TYPE_CHECKBOX),
+				$this->gridQuestion(8, 'Give numbers', 'numbers', Constants::ANSWER_GRID_TYPE_NUMBER),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(7, json_encode([21 => [25, 26]])),
+				// A zero is a real number and must not be dropped
+				$this->makeAnswer(8, json_encode([41 => [45 => 3, 46 => 0]])),
+			],
+			'{pick} / {numbers}',
+			optionsByQuestion: [
+				7 => [
+					$this->createOption(21, 'Speed', Option::OPTION_TYPE_ROW),
+					$this->createOption(25, 'Good', Option::OPTION_TYPE_COLUMN),
+					$this->createOption(26, 'Cheap', Option::OPTION_TYPE_COLUMN),
+				],
+				8 => [
+					$this->createOption(41, 'Speed', Option::OPTION_TYPE_ROW),
+					$this->createOption(45, 'Min', Option::OPTION_TYPE_COLUMN),
+					$this->createOption(46, 'Max', Option::OPTION_TYPE_COLUMN),
+				],
+			],
+		);
+
+		$this->assertSame('Speed: Good; Cheap / Speed: Min: 3; Max: 0', $payload['body']);
+	}
+
+	public function testSendKeepsOptionsLabelledZero(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->gridQuestion(7, 'Rate 0 to 2', 'rate', Constants::ANSWER_GRID_TYPE_RADIO),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(7, json_encode([21 => 25])),
+			],
+			'{rate}',
+			optionsByQuestion: [
+				7 => [
+					$this->createOption(21, 'Speed', Option::OPTION_TYPE_ROW),
+					// A rating scale starting at zero is an ordinary form
+					$this->createOption(25, '0', Option::OPTION_TYPE_COLUMN),
+				],
+			],
+		);
+
+		$this->assertSame('Speed: 0', $payload['body']);
+	}
+
+	public function testSendResolvesRankingOptionLabels(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->createQuestionEntity([
+					'id' => 9,
+					'type' => Constants::ANSWER_TYPE_RANKING,
+					'text' => 'Rank these',
+					'name' => 'rank',
+				]),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				// Stored as an ordered JSON list of option ids
+				$this->makeAnswer(9, json_encode([31, 29, 30])),
+			],
+			'{rank}',
+			optionsByQuestion: [
+				9 => [
+					$this->createOption(29, 'Red'),
+					$this->createOption(30, 'Green'),
+					$this->createOption(31, 'Blue'),
+				],
+			],
+		);
+
+		$this->assertSame('1. Blue, 2. Red, 3. Green', $payload['body']);
+	}
+
+	public function testSendKeepsRankingPositionsWhenAnOptionNoLongerResolves(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->createQuestionEntity([
+					'id' => 9,
+					'type' => Constants::ANSWER_TYPE_RANKING,
+					'text' => 'Rank these',
+					'name' => 'rank',
+				]),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(9, json_encode([31, 29, 30])),
+			],
+			'{rank}',
+			// Option 29 was deleted after the submission and no longer resolves
+			optionsByQuestion: [
+				9 => [
+					$this->createOption(30, 'Green'),
+					$this->createOption(31, 'Blue'),
+				],
+			],
+		);
+
+		// Green stays 3rd; it must not be promoted to 2nd by the missing option
+		$this->assertSame('1. Blue, 3. Green', $payload['body']);
+	}
+
+	public function testSendFallsBackToTheDashForAnswersThatAreNotAJsonStructure(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->gridQuestion(7, 'Broken grid', 'grid', Constants::ANSWER_GRID_TYPE_RADIO),
+				$this->createQuestionEntity([
+					'id' => 9,
+					'type' => Constants::ANSWER_TYPE_RANKING,
+					'text' => 'Broken ranking',
+					'name' => 'rank',
+				]),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				// Corrupt rows that decode to a bare scalar rather than a structure:
+				// casting them to an array would silently address real option ids
+				$this->makeAnswer(7, '25'),
+				$this->makeAnswer(9, '25'),
+			],
+			'{grid} / {rank}',
+			optionsByQuestion: [
+				7 => [
+					$this->createOption(21, 'Speed', Option::OPTION_TYPE_ROW),
+					$this->createOption(25, 'Good', Option::OPTION_TYPE_COLUMN),
+				],
+				9 => [$this->createOption(25, 'Blue')],
+			],
+		);
+
+		$this->assertSame('— / —', $payload['body']);
+	}
+
+	public function testSendNeverExpandsPlaceholdersComingFromAnswers(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->createQuestionEntity([
+					'id' => 3,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => 'Your name',
+					'name' => 'name',
+				]),
+				$this->emailQuestion(),
+			],
+			[
+				// A respondent typing another field's placeholder must not have it expanded
+				$this->makeAnswer(3, '{email}'),
+				$this->makeAnswer(5, 'alice@example.com'),
+			],
+			'Dear {name}, thanks.',
+		);
+
+		$this->assertSame('Dear {email}, thanks.', $payload['body']);
+	}
+
+	public function testSendKeepsBlankAnswersInFieldPlaceholders(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->createQuestionEntity([
+					'id' => 3,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => 'Your name',
+					'name' => 'name',
+				]),
+				$this->emailQuestion(),
+			],
+			[
+				$this->makeAnswer(3, '   '),
+				$this->makeAnswer(5, 'alice@example.com'),
+			],
+			'Name:[{name}]',
+		);
+
+		// The stored answer is rendered as-is; the placeholder is not left unreplaced
+		$this->assertSame('Name:[   ]', $payload['body']);
 	}
 
 	public function testSendDoesNothingWhenRateLimitExceeded(): void {
@@ -329,7 +627,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			]),
 		]);
 		$this->answerMapper->method('findBySubmission')->willReturn([
-			$this->makeEmailAnswer(10, 5, 'user@example.com'),
+			$this->makeAnswer(5, 'user@example.com'),
 		]);
 		$this->emailValidator->method('isValid')->willReturn(true);
 
@@ -350,6 +648,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			$this->configService,
 			$this->answerMapper,
 			$this->questionMapper,
+			$this->optionMapper,
 			$this->emailValidator,
 			$this->jobList,
 			$this->cacheFactory,
@@ -375,7 +674,7 @@ class ConfirmationEmailServiceTest extends TestCase {
 			]),
 		]);
 		$this->answerMapper->method('findBySubmission')->willReturn([
-			$this->makeEmailAnswer(10, 5, 'user@example.com'),
+			$this->makeAnswer(5, 'user@example.com'),
 		]);
 		$this->emailValidator->method('isValid')->willReturn(true);
 

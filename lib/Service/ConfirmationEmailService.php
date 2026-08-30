@@ -29,7 +29,10 @@ use Psr\Log\LoggerInterface;
 class ConfirmationEmailService {
 	private const RATE_LIMIT_TTL = 86400; // 24 hours
 
-	/** Shown when an answer has no resolvable value */
+	/** Placeholder rendering all questions of the form with the given answers */
+	private const PLACEHOLDER_SUBMISSION_SUMMARY = '{submissionSummary}';
+
+	/** Shown in the submission summary for questions the respondent left unanswered */
 	private const EMPTY_ANSWER = '—';
 
 	private readonly ICache $rateLimitCache;
@@ -199,9 +202,15 @@ class ConfirmationEmailService {
 			$replacements[$placeholder] = implode('; ', $this->formatAnswer($question, $answers));
 		}
 
+		// Only built when actually used, as it may need to resolve options from the database
+		$summary = str_contains($body, self::PLACEHOLDER_SUBMISSION_SUMMARY)
+			? $this->buildSubmissionSummary($questions, $answerMap)
+			: '';
+
 		return [
-			$this->replacePlaceholders($subject, $replacements),
-			$this->replacePlaceholders($body, $replacements),
+			// The summary spans multiple lines, so it is dropped from the subject
+			$this->replacePlaceholders($subject, $replacements + [self::PLACEHOLDER_SUBMISSION_SUMMARY => '']),
+			$this->replacePlaceholders($body, $replacements + [self::PLACEHOLDER_SUBMISSION_SUMMARY => $summary]),
 		];
 	}
 
@@ -218,6 +227,51 @@ class ConfirmationEmailService {
 			static fn (array $matches): string => $replacements[$matches[0]] ?? $matches[0],
 			$text
 		) ?? $text;
+	}
+
+	/**
+	 * Render the submission as one "label: answer" line per question, in form order
+	 *
+	 * @param list<array<string, mixed>> $questions
+	 * @param array<int, list<string>> $answerMap
+	 */
+	private function buildSubmissionSummary(array $questions, array $answerMap): string {
+		$lines = [];
+		foreach ($questions as $question) {
+			$label = trim((string)($question['text'] ?? ''));
+			if ($label === '') {
+				$label = trim((string)($question['name'] ?? ''));
+			}
+			if ($label === '') {
+				// TRANSLATORS Shown in the confirmation email for a question without a title.
+				$label = $this->l10n->t('Untitled question');
+			}
+
+			// A blank answer is listed as unanswered rather than as an empty value
+			$answers = array_values(array_filter(
+				$answerMap[$question['id']] ?? [],
+				static fn (string $answer): bool => trim($answer) !== ''
+			));
+			if ($answers === []) {
+				$lines[] = $label . ': ' . self::EMPTY_ANSWER;
+				continue;
+			}
+
+			$rendered = $this->formatAnswer($question, $answers);
+			if (count($rendered) === 1) {
+				$lines[] = $label . ': ' . $rendered[0];
+				continue;
+			}
+
+			// A grid spans several lines. Indentation would collapse in the HTML part
+			// of the mail, so the rows are marked with a dash instead.
+			$lines[] = $label . ':';
+			foreach ($rendered as $rowLine) {
+				$lines[] = '- ' . $rowLine;
+			}
+		}
+
+		return implode("\n", $lines);
 	}
 
 	/**

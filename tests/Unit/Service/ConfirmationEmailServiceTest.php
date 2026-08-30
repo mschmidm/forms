@@ -608,6 +608,216 @@ class ConfirmationEmailServiceTest extends TestCase {
 		$this->assertSame('Name:[   ]', $payload['body']);
 	}
 
+	public function testSendReplacesSubmissionSummaryPlaceholder(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->createQuestionEntity([
+					'id' => 3,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => 'Your name',
+					'name' => 'name',
+				]),
+				$this->emailQuestion(),
+				$this->createQuestionEntity([
+					'id' => 7,
+					'type' => Constants::ANSWER_TYPE_MULTIPLE,
+					'text' => 'Favourite colours',
+					'name' => '',
+				]),
+				$this->createQuestionEntity([
+					'id' => 9,
+					'type' => Constants::ANSWER_TYPE_LONG,
+					'text' => 'Comments',
+					'name' => '',
+				]),
+			],
+			[
+				$this->makeAnswer(3, 'Alice'),
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(7, 'Red'),
+				$this->makeAnswer(7, 'Blue'),
+			],
+			"Your submission:\n\n{submissionSummary}",
+		);
+
+		$this->assertSame(
+			"Your submission:\n\n"
+			. "Your name: Alice\n"
+			. "Email: alice@example.com\n"
+			. "Favourite colours: Red; Blue\n"
+			// unanswered question is listed with a dash
+			. 'Comments: —',
+			$payload['body']
+		);
+	}
+
+	public function testSendListsGridRowsOnTheirOwnLinesInTheSummary(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->gridQuestion(7, 'Rate these', 'rate', Constants::ANSWER_GRID_TYPE_RADIO),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(7, json_encode([21 => 25, 22 => 26])),
+			],
+			'{submissionSummary}',
+			optionsByQuestion: [
+				7 => [
+					$this->createOption(21, 'Speed', Option::OPTION_TYPE_ROW),
+					$this->createOption(22, 'Price', Option::OPTION_TYPE_ROW),
+					$this->createOption(25, 'Good', Option::OPTION_TYPE_COLUMN),
+					$this->createOption(26, 'Fair', Option::OPTION_TYPE_COLUMN),
+				],
+			],
+		);
+
+		// Dash markers, because indentation would collapse in the HTML part of the mail
+		$this->assertSame(
+			"Email: alice@example.com\n"
+			. "Rate these:\n"
+			. "- Speed: Good\n"
+			. '- Price: Fair',
+			$payload['body']
+		);
+	}
+
+	public function testSendLabelsQuestionsWithoutATitle(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->createQuestionEntity([
+					'id' => 11,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => '',
+					'name' => '',
+				]),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(11, 'kept'),
+			],
+			'{submissionSummary}',
+		);
+
+		// The answer must not be dropped just because the question has no title
+		$this->assertSame(
+			"Email: alice@example.com\n"
+			. 'Untitled question: kept',
+			$payload['body']
+		);
+	}
+
+	public function testSendFallsBackToTheQuestionNameWhenItHasNoText(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->emailQuestion(),
+				$this->createQuestionEntity([
+					'id' => 11,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => '',
+					'name' => 'internal_name',
+				]),
+			],
+			[
+				$this->makeAnswer(5, 'alice@example.com'),
+				$this->makeAnswer(11, 'kept'),
+			],
+			'{submissionSummary}',
+		);
+
+		$this->assertSame(
+			"Email: alice@example.com\n"
+			. 'internal_name: kept',
+			$payload['body']
+		);
+	}
+
+	public function testSendListsBlankAnswersAsUnansweredInTheSummary(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->createQuestionEntity([
+					'id' => 3,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => 'Your name',
+					'name' => 'name',
+				]),
+				$this->emailQuestion(),
+			],
+			[
+				$this->makeAnswer(3, '   '),
+				$this->makeAnswer(5, 'alice@example.com'),
+			],
+			'{submissionSummary}',
+		);
+
+		$this->assertSame(
+			"Your name: —\n"
+			. 'Email: alice@example.com',
+			$payload['body']
+		);
+	}
+
+	public function testSendNeverExpandsPlaceholdersFromAnswersInTheSummary(): void {
+		$payload = $this->queueAndCapture(
+			[
+				$this->createQuestionEntity([
+					'id' => 3,
+					'type' => Constants::ANSWER_TYPE_SHORT,
+					'text' => 'Your name',
+					'name' => 'name',
+				]),
+				$this->createQuestionEntity([
+					'id' => 4,
+					'type' => Constants::ANSWER_TYPE_LONG,
+					'text' => 'Notes',
+					'name' => 'notes',
+				]),
+				$this->emailQuestion(),
+			],
+			[
+				// A respondent typing placeholders must not have them expanded, in either direction
+				$this->makeAnswer(3, '{submissionSummary}'),
+				$this->makeAnswer(4, '{email}'),
+				$this->makeAnswer(5, 'alice@example.com'),
+			],
+			"Dear {name}, thanks.\n{submissionSummary}",
+		);
+
+		$this->assertSame(
+			"Dear {submissionSummary}, thanks.\n"
+			. "Your name: {submissionSummary}\n"
+			. "Notes: {email}\n"
+			. 'Email: alice@example.com',
+			$payload['body']
+		);
+	}
+
+	public function testSendDropsSubmissionSummaryFromSubject(): void {
+		$payload = $this->queueAndCapture(
+			[$this->emailQuestion()],
+			[$this->makeAnswer(5, 'alice@example.com')],
+			'Thanks',
+			'Received{submissionSummary}',
+		);
+
+		// It spans several lines, so it has no place in a subject
+		$this->assertSame('Received', $payload['subject']);
+	}
+
+	public function testSendKeepsTheSubmissionSummaryOutOfTheDefaultBody(): void {
+		$payload = $this->queueAndCapture(
+			[$this->emailQuestion()],
+			[$this->makeAnswer(5, 'user@example.com')],
+			'',
+		);
+
+		// An admin who never edited the body must not start mailing whole submissions,
+		// and no unreplaced placeholder may leak into the sent mail either
+		$this->assertStringNotContainsString('Email: user@example.com', $payload['body']);
+		$this->assertStringNotContainsString('{submissionSummary}', $payload['body']);
+	}
+
 	public function testSendDoesNothingWhenRateLimitExceeded(): void {
 		$form = Form::fromParams([
 			'id' => 1,

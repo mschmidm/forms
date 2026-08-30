@@ -243,7 +243,16 @@
 				<p class="confirmation-email__placeholder-hint">
 					{{ t('forms', 'Available placeholders:') }}
 					<code>{formTitle}</code>, <code>{formDescription}</code>,
+					<code>{submissionSummary}</code>,
 					{{ t('forms', 'and field labels.') }}
+					<br />
+					<!-- TRANSLATORS {submissionSummary} is a literal placeholder and must not be translated -->
+					{{
+						t(
+							'forms',
+							'Add {submissionSummary} to the email body to include all questions of the form together with the given answers.',
+						)
+					}}
 				</p>
 				<NcInputField
 					v-model="confirmationEmailSubject"

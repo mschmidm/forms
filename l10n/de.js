@@ -245,7 +245,7 @@ OC.L10N.register(
     "Embeddable link" : "Einbettbarer Link",
     "Embeddable link token" : "Einbettbarer Link-Token",
     "Share link token" : "Link-Token teilen",
-    "Set the public share link token to something easy to remember or generate a new token." : "Für den öffentlichen Freigabelink ein leicht zu merkendes Token festLegen oder ein neues Token generieren.",
+    "Set the public share link token to something easy to remember or generate a new token." : "Für den öffentlichen Freigabelink ein leicht zu merkendes Token festlegen oder ein neues Token generieren.",
     "Generating…" : "Generieren …",
     "Generate new token" : "Neues Token generieren",
     "Copy to clipboard" : "In die Zwischenablage kopieren",
@@ -420,7 +420,6 @@ OC.L10N.register(
     "People can enter a number" : "Teilnehmer können eine Zahl eingeben",
     "Enter a number" : "Zahl eingeben",
     "Custom regular expression" : "Benutzerdefinierter regulärer Ausdruck",
-    "The input does not match the required pattern" : "Die Eingabe entspricht nicht dem erforderlichen Muster",
-    "Insert question" : "Frage einfügen"
+    "The input does not match the required pattern" : "Die Eingabe entspricht nicht dem erforderlichen Muster"
 },
 "nplurals=2; plural=(n != 1);");

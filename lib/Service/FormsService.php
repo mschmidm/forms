@@ -11,6 +11,7 @@ use OCA\Forms\Activity\ActivityManager;
 use OCA\Forms\Constants;
 use OCA\Forms\Db\Form;
 use OCA\Forms\Db\FormMapper;
+use OCA\Forms\Db\Option;
 use OCA\Forms\Db\OptionMapper;
 use OCA\Forms\Db\Question;
 use OCA\Forms\Db\QuestionMapper;
@@ -114,9 +115,19 @@ class FormsService {
 		$questionList = [];
 		try {
 			$questionEntities = $this->questionMapper->findByForm($formId);
+
+			$questionIds = array_map(static fn (Question $question) => $question->getId(), $questionEntities);
+			$optionsByQuestion = [];
+			foreach ($this->optionMapper->findByQuestions($questionIds) as $optionEntity) {
+				$optionsByQuestion[$optionEntity->getQuestionId()][] = $optionEntity;
+			}
+
 			foreach ($questionEntities as $questionEntity) {
 				$question = $questionEntity->read();
-				$question['options'] = $this->getOptions($question['id']);
+				$question['options'] = array_map(
+					static fn (Option $option) => $option->read(),
+					$optionsByQuestion[$question['id']] ?? []
+				);
 				$question['accept'] = [];
 				if ($question['type'] === Constants::ANSWER_TYPE_FILE) {
 					if ($question['extraSettings']['allowedFileTypes'] ?? null) {
@@ -236,39 +247,59 @@ class FormsService {
 	}
 
 	/**
-	 * Create partial form, as returned by Forms-Lists.
+	 * Create partial forms, as returned by Forms-Lists.
+	 * Submission counts are counted with at most two queries for all given forms.
 	 *
-	 * @param Form $form
-	 * @return array
+	 * @param Form[] $forms
+	 * @return list<array>
 	 * @throws IMapperException
 	 */
-	public function getPartialFormArray(Form $form): array {
-		$result = [
-			'id' => $form->getId(),
-			'hash' => $form->getHash(),
-			'title' => $form->getTitle(),
-			'expires' => $form->getExpires(),
-			'lastUpdated' => $form->getLastUpdated(),
-			'permissions' => $this->getPermissions($form),
-			'partial' => true,
-			'state' => $form->getState(),
-			'lockedBy' => $form->getLockedBy(),
-			'lockedUntil' => $form->getLockedUntil(),
-		];
+	public function getPartialFormArrays(array $forms): array {
+		$results = [];
+		$formIdsWithResultsPermission = [];
+		$formIdsWithoutResultsPermission = [];
 
-		// Append submissionCount if currentUser has permissions to see results
-		if (in_array(Constants::PERMISSION_RESULTS, $result['permissions'])) {
-			$result['submissionCount'] = $this->submissionMapper->countSubmissions($form->getId());
-		} else {
-			$userSubmissionCount = $this->submissionMapper->countSubmissions($form->getId(), $this->currentUser->getUID());
-			if ($userSubmissionCount > 0) {
-				$result['submissionCount'] = $userSubmissionCount;
-				// Append `results` permission if user has submitted to the form
-				$result['permissions'][] = Constants::PERMISSION_RESULTS;
+		foreach ($forms as $key => $form) {
+			$permissions = $this->getPermissions($form);
+			$results[$key] = [
+				'id' => $form->getId(),
+				'hash' => $form->getHash(),
+				'title' => $form->getTitle(),
+				'expires' => $form->getExpires(),
+				'lastUpdated' => $form->getLastUpdated(),
+				'permissions' => $permissions,
+				'partial' => true,
+				'state' => $form->getState(),
+				'lockedBy' => $form->getLockedBy(),
+				'lockedUntil' => $form->getLockedUntil(),
+			];
+
+			if (in_array(Constants::PERMISSION_RESULTS, $permissions)) {
+				$formIdsWithResultsPermission[$key] = $form->getId();
+			} else {
+				$formIdsWithoutResultsPermission[$key] = $form->getId();
 			}
 		}
 
-		return $result;
+		// Append submissionCount if currentUser has permissions to see results
+		$submissionCounts = $this->submissionMapper->countSubmissionsByForms(array_values($formIdsWithResultsPermission));
+		foreach ($formIdsWithResultsPermission as $key => $formId) {
+			$results[$key]['submissionCount'] = $submissionCounts[$formId] ?? 0;
+		}
+
+		if ($formIdsWithoutResultsPermission !== [] && $this->currentUser !== null) {
+			$userSubmissionCounts = $this->submissionMapper->countSubmissionsByForms(array_values($formIdsWithoutResultsPermission), $this->currentUser->getUID());
+			foreach ($formIdsWithoutResultsPermission as $key => $formId) {
+				$userSubmissionCount = $userSubmissionCounts[$formId] ?? 0;
+				if ($userSubmissionCount > 0) {
+					$results[$key]['submissionCount'] = $userSubmissionCount;
+					// Append `results` permission if user has submitted to the form
+					$results[$key]['permissions'][] = Constants::PERMISSION_RESULTS;
+				}
+			}
+		}
+
+		return array_values($results);
 	}
 
 	/**
@@ -861,9 +892,40 @@ class FormsService {
 
 		// Validate extraSettings for specific question types
 		if ($questionType === Constants::ANSWER_TYPE_DATE) {
+			$format = Constants::ANSWER_PHPDATETIME_FORMAT['date'];
+			$dateMinDate = null;
+			$dateMaxDate = null;
+
+			// Validate dateMin format
+			if (isset($extraSettings['dateMin'])) {
+				if (is_numeric($extraSettings['dateMin'])) {
+					$dateMinDate = \DateTime::createFromFormat('!Y-m-d', (new \DateTime('@' . (int)$extraSettings['dateMin']))
+						->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d'));
+				} else {
+					$dateMinString = $extraSettings['dateMin'];
+					$dateMinDate = \DateTime::createFromFormat('!' . $format, $dateMinString);
+					if (!$dateMinDate || $dateMinDate->format($format) !== $dateMinString) {
+						return false;
+					}
+				}
+			}
+
+			// Validate dateMax format
+			if (isset($extraSettings['dateMax'])) {
+				if (is_numeric($extraSettings['dateMax'])) {
+					$dateMaxDate = \DateTime::createFromFormat('!Y-m-d', (new \DateTime('@' . (int)$extraSettings['dateMax']))
+						->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d'));
+				} else {
+					$dateMaxString = $extraSettings['dateMax'];
+					$dateMaxDate = \DateTime::createFromFormat('!' . $format, $dateMaxString);
+					if (!$dateMaxDate || $dateMaxDate->format($format) !== $dateMaxString) {
+						return false;
+					}
+				}
+			}
+
 			// Ensure dateMin and dateMax don't overlap
-			if (isset($extraSettings['dateMin']) && isset($extraSettings['dateMax'])
-				&& $extraSettings['dateMin'] > $extraSettings['dateMax']) {
+			if ($dateMinDate !== null && $dateMaxDate !== null && $dateMinDate > $dateMaxDate) {
 				return false;
 			}
 		} elseif ($questionType === Constants::ANSWER_TYPE_TIME) {
@@ -1015,6 +1077,17 @@ class FormsService {
 
 	public function getFormUploadedFilesFolderPath(Form $form): string {
 		return $this->filePathHelper->getFormUploadedFilesFolderPath($form);
+	}
+
+	/**
+	 * Keep Forms upload folder name in sync with the form title.
+	 */
+	public function syncFormUploadFolderName(Form $form): void {
+		try {
+			$this->filePathHelper->syncFormUploadFolderName($form);
+		} catch (\Throwable $e) {
+			$this->logger->warning('Failed to sync form upload folder name', ['exception' => $e]);
+		}
 	}
 
 	public function getUploadedFilePath(Form $form, int $submissionId, int $questionId, ?string $questionName, string $questionText): string {

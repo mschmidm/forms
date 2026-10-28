@@ -17,6 +17,7 @@ use OCA\Forms\Db\Option;
 use OCA\Forms\Db\OptionMapper;
 use OCA\Forms\Db\Question;
 use OCA\Forms\Db\QuestionMapper;
+use OCA\Forms\Db\Submission;
 use OCA\Forms\Db\SubmissionMapper;
 use OCA\Forms\Db\UploadedFileMapper;
 use OCA\Forms\ResponseDefinitions;
@@ -110,9 +111,18 @@ class SubmissionService {
 		try {
 			$submissionEntities = $this->submissionMapper->findByForm($formId, $userId, $query, $limit, $offset);
 
+			$submissionIds = array_map(static fn (Submission $submission) => $submission->getId(), $submissionEntities);
+			$answersBySubmission = [];
+			foreach ($this->answerMapper->findBySubmissions($submissionIds) as $answer) {
+				$answersBySubmission[$answer->getSubmissionId()][] = $answer;
+			}
+
 			foreach ($submissionEntities as $submissionEntity) {
 				$submission = $submissionEntity->read();
-				$submission['answers'] = $this->getAnswers($submission['id']);
+				$submission['answers'] = array_map(
+					static fn (Answer $answer) => $answer->read(),
+					$answersBySubmission[$submission['id']] ?? []
+				);
 				$submissionList[] = $submission;
 			}
 		} catch (DoesNotExistException) {
@@ -221,6 +231,7 @@ class SubmissionService {
 			throw new \InvalidArgumentException('Invalid file format');
 		}
 
+		$submissionEntities = [];
 		try {
 			$submissionEntities = $this->submissionMapper->findByForm($form->getId());
 		} catch (DoesNotExistException) {
@@ -237,6 +248,26 @@ class SubmissionService {
 			$userTimezone = $this->userConfig->getValueString($form->getOwnerId(), 'core', 'timezone', $defaultTimeZone);
 		} else {
 			$userTimezone = $this->userConfig->getValueString($this->currentUser->getUID(), 'core', 'timezone', $defaultTimeZone);
+		}
+
+		// Fetch all answers of the loaded submissions at once, grouped by submission
+		$submissionIds = array_map(static fn (Submission $submission) => $submission->getId(), $submissionEntities);
+		$answersBySubmission = [];
+		foreach ($this->answerMapper->findBySubmissions($submissionIds) as $answer) {
+			$answersBySubmission[$answer->getSubmissionId()][] = $answer;
+		}
+
+		// Resolve each submitting user's display name only once
+		$userDisplayNames = [];
+		foreach (array_unique(array_map(static fn (Submission $submission) => $submission->getUserId(), $submissionEntities)) as $userId) {
+			$userDisplayNames[$userId] = $this->userManager->getDisplayName($userId);
+		}
+
+		// Fetch all options of the form's questions at once, grouped by question
+		$questionIds = array_map(static fn (Question $question) => $question->getId(), $questions);
+		$optionsByQuestion = [];
+		foreach ($this->optionMapper->findByQuestions($questionIds) as $option) {
+			$optionsByQuestion[$option->getQuestionId()][] = $option;
 		}
 
 		// Process initial header
@@ -258,7 +289,7 @@ class SubmissionService {
 		foreach ($questions as $question) {
 			if ($question->getType() === Constants::ANSWER_TYPE_GRID) {
 				$gridCellType = $question->getExtraSettings()['questionType'];
-				$options = $this->optionMapper->findByQuestion($question->getId());
+				$options = $optionsByQuestion[$question->getId()] ?? [];
 
 				foreach ($options as $option) {
 					$optionPerOptionId[$option->getId()] = $option;
@@ -282,7 +313,7 @@ class SubmissionService {
 					}
 				}
 			} elseif ($question->getType() === Constants::ANSWER_TYPE_RANKING) {
-				$options = $this->optionMapper->findByQuestion($question->getId());
+				$options = $optionsByQuestion[$question->getId()] ?? [];
 				foreach ($options as $option) {
 					$optionPerOptionId[$option->getId()] = $option;
 					$rankingOptionsPerQuestionId[$question->getId()][] = $option->getId();
@@ -307,22 +338,23 @@ class SubmissionService {
 			$row[] = $submission->getId();
 
 			// User
-			$user = $this->userManager->get($submission->getUserId());
-			if ($user === null) {
+			$userId = $submission->getUserId();
+			$displayName = $userDisplayNames[$userId] ?? null;
+			if ($displayName === null) {
 				// Give empty userId
 				$row[] = '';
 				// TRANSLATORS Shown on export if no Display-Name is available.
 				$row[] = $this->l10n->t('Anonymous user');
 			} else {
-				$row[] = $user->getUID();
-				$row[] = $user->getDisplayName();
+				$row[] = $userId;
+				$row[] = $displayName;
 			}
 
 			// Date
 			$row[] = date_format(date_timestamp_set(new DateTime(), $submission->getTimestamp())->setTimezone(new DateTimeZone($userTimezone)), 'c');
 
 			// Answers, make sure we keep the question order
-			$answers = array_reduce($this->answerMapper->findBySubmission($submission->getId()),
+			$answers = array_reduce($answersBySubmission[$submission->getId()] ?? [],
 				function (array $carry, Answer $answer) use ($questionPerQuestionId, $gridRowsPerQuestionId, $gridColumnsPerQuestionId, $rankingOptionsPerQuestionId, $optionPerOptionId) {
 					$questionId = $answer->getQuestionId();
 					$questionType = isset($questionPerQuestionId[$questionId]) ? $questionPerQuestionId[$questionId]->getType() : null;
@@ -501,10 +533,7 @@ class SubmissionService {
 			$submissionId = (string)$rowData[$submissionIdColIndex];
 			$row = $existingSubmissionIds[$submissionId] ?? null;
 
-			if ($row === null) {
-				// Append new row
-				$row = $activeWorksheet->getHighestRow() + 1;
-			}
+			$row ??= $activeWorksheet->getHighestRow() + 1;
 
 			$dataIndex = 0;
 			$columnIndex = 1;
@@ -755,10 +784,33 @@ class SubmissionService {
 			$previousDate = $d;
 
 			if ($extraSettings) {
-				if ((isset($extraSettings['dateMin']) && $d < (new DateTime())->setTimestamp($extraSettings['dateMin']))
-					|| (isset($extraSettings['dateMax']) && $d > (new DateTime())->setTimestamp($extraSettings['dateMax']))
-					|| (isset($extraSettings['timeMin']) && $d < DateTime::createFromFormat($format, $extraSettings['timeMin']))
-					|| (isset($extraSettings['timeMax']) && $d > DateTime::createFromFormat($format, $extraSettings['timeMax']))
+				$dateMin = isset($extraSettings['dateMin'])
+					? (is_numeric($extraSettings['dateMin'])
+						? DateTime::createFromFormat('!Y-m-d', (new DateTime('@' . (int)$extraSettings['dateMin']))
+							->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d'))
+						: DateTime::createFromFormat('!' . $format, $extraSettings['dateMin']))
+					: null;
+				$dateMax = isset($extraSettings['dateMax'])
+					? (is_numeric($extraSettings['dateMax'])
+						? DateTime::createFromFormat('!Y-m-d', (new DateTime('@' . (int)$extraSettings['dateMax']))
+							->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d'))
+						: DateTime::createFromFormat('!' . $format, $extraSettings['dateMax']))
+					: null;
+				$timeMin = isset($extraSettings['timeMin'])
+					? DateTime::createFromFormat($format, $extraSettings['timeMin'])
+					: null;
+				$timeMax = isset($extraSettings['timeMax'])
+					? DateTime::createFromFormat($format, $extraSettings['timeMax'])
+					: null;
+
+				$compareDate = ($dateMin !== null || $dateMax !== null)
+					? (DateTime::createFromFormat('!' . $format, $dateStr) ?: $d)
+					: $d;
+
+				if (($dateMin instanceof \DateTimeInterface && $compareDate < $dateMin)
+					|| ($dateMax instanceof \DateTimeInterface && $compareDate > $dateMax)
+					|| ($timeMin instanceof \DateTimeInterface && $d < $timeMin)
+					|| ($timeMax instanceof \DateTimeInterface && $d > $timeMax)
 				) {
 					throw new \InvalidArgumentException(sprintf('Date/time is not in the allowed range for question "%s".', $text));
 				}

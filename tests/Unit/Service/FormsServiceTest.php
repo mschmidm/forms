@@ -46,9 +46,9 @@ use OCA\Forms\Service\CirclesService;
 use OCA\Forms\Service\ConfigService;
 use OCA\Forms\Service\ConfirmationEmailService;
 use OCA\Forms\Service\FormsService;
+use OCA\Forms\Tests\Unit\UserFolderMockTrait;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\EventDispatcher\IEventDispatcher;
-use OCP\Files\Folder;
 use OCP\Files\IFilenameValidator;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
@@ -66,6 +66,7 @@ use Psr\Log\LoggerInterface;
 use Test\TestCase;
 
 class FormsServiceTest extends TestCase {
+	use UserFolderMockTrait;
 
 	private FormsService $formsService;
 	private ActivityManager|MockObject $activityManager;
@@ -342,8 +343,8 @@ class FormsServiceTest extends TestCase {
 		$option2->setQuestionId(1);
 		$option2->setText('Option 2');
 		$this->optionMapper->expects($this->any())
-			->method('findByQuestion')
-			->with(1)
+			->method('findByQuestions')
+			->with([1, 2])
 			->willReturn([$option1, $option2]);
 
 		$share = new Share();
@@ -400,12 +401,12 @@ class FormsServiceTest extends TestCase {
 		$form->setLastUpdated(123456789);
 
 		$this->submissionMapper->expects($this->once())
-			->method('countSubmissions')
-			->with(42)
-			->willReturn(123);
+			->method('countSubmissionsByForms')
+			->with([42])
+			->willReturn([42 => 123]);
 
 		// Run the test
-		$this->assertEquals($expected, $this->formsService->getPartialFormArray($form));
+		$this->assertEquals($expected, $this->formsService->getPartialFormArrays([$form])[0]);
 	}
 
 	public static function dataGetPartialFormShared() {
@@ -453,12 +454,143 @@ class FormsServiceTest extends TestCase {
 			->willReturn([$share]);
 
 		$this->submissionMapper->expects($this->once())
-			->method('countSubmissions')
-			->with(42)
-			->willReturn(123);
+			->method('countSubmissionsByForms')
+			->with([42])
+			->willReturn([42 => 123]);
 
 		// Run the test
-		$this->assertEquals($expected, $this->formsService->getPartialFormArray($form));
+		$this->assertEquals($expected, $this->formsService->getPartialFormArrays([$form])[0]);
+	}
+
+	/**
+	 * Shared users without results permission get the count of their own
+	 * submissions and the `results` permission appended once they submitted.
+	 */
+	public function testGetPartialFormSharedUserSubmissions() {
+		$expected = [
+			'id' => 42,
+			'hash' => 'abcdefg',
+			'title' => 'Form 1',
+			'expires' => 0,
+			'lastUpdated' => 123456789,
+			'permissions' => ['submit', 'results'],
+			'submissionCount' => 2,
+			'state' => 0,
+			'partial' => true,
+			'lockedBy' => null,
+			'lockedUntil' => null,
+		];
+
+		$form = new Form();
+		$form->setId(42);
+		$form->setState(0);
+		$form->setHash('abcdefg');
+		$form->setTitle('Form 1');
+		$form->setOwnerId('otherUser');
+		$form->setExpires(0);
+		$form->setLastUpdated(123456789);
+
+		$share = new Share();
+		$share->setFormId(42);
+		$share->setPermissions([Constants::PERMISSION_SUBMIT]);
+		$share->setShareType(IShare::TYPE_USER);
+		$share->setShareWith('currentUser');
+
+		$this->shareMapper->expects($this->any())
+			->method('findByForm')
+			->with(42)
+			->willReturn([$share]);
+
+		$this->submissionMapper->expects($this->exactly(2))
+			->method('countSubmissionsByForms')
+			->willReturnCallback(function (array $formIds, ?string $userId = null): array {
+				if ($userId === null) {
+					$this->assertSame([], $formIds);
+					return [];
+				}
+				$this->assertSame([42], $formIds);
+				$this->assertSame('currentUser', $userId);
+				return [42 => 2];
+			});
+
+		$this->assertEquals($expected, $this->formsService->getPartialFormArrays([$form])[0]);
+	}
+
+	/**
+	 * Submission counts for multiple forms are fetched with a single query per
+	 * permission bucket instead of one query per form.
+	 */
+	public function testGetPartialFormArraysCountsInBulk() {
+		$ownedForm = new Form();
+		$ownedForm->setId(42);
+		$ownedForm->setState(0);
+		$ownedForm->setHash('abcdefg');
+		$ownedForm->setTitle('Form 1');
+		$ownedForm->setOwnerId('currentUser');
+		$ownedForm->setExpires(0);
+		$ownedForm->setLastUpdated(123456789);
+
+		$sharedForm = new Form();
+		$sharedForm->setId(43);
+		$sharedForm->setState(0);
+		$sharedForm->setHash('hijklmn');
+		$sharedForm->setTitle('Form 2');
+		$sharedForm->setOwnerId('otherUser');
+		$sharedForm->setExpires(0);
+		$sharedForm->setLastUpdated(123456789);
+
+		$share = new Share();
+		$share->setFormId(43);
+		$share->setPermissions([Constants::PERMISSION_SUBMIT]);
+		$share->setShareType(IShare::TYPE_USER);
+		$share->setShareWith('currentUser');
+
+		$this->shareMapper->expects($this->any())
+			->method('findByForm')
+			->with(43)
+			->willReturn([$share]);
+
+		$this->submissionMapper->expects($this->exactly(2))
+			->method('countSubmissionsByForms')
+			->willReturnCallback(function (array $formIds, ?string $userId = null): array {
+				if ($userId === null) {
+					$this->assertSame([42], $formIds);
+					return [42 => 7];
+				}
+				$this->assertSame('currentUser', $userId);
+				$this->assertSame([43], $formIds);
+				return [];
+			});
+
+		$expected = [
+			[
+				'id' => 42,
+				'hash' => 'abcdefg',
+				'title' => 'Form 1',
+				'expires' => 0,
+				'lastUpdated' => 123456789,
+				'permissions' => Constants::PERMISSION_ALL,
+				'partial' => true,
+				'state' => 0,
+				'lockedBy' => null,
+				'lockedUntil' => null,
+				'submissionCount' => 7,
+			],
+			[
+				'id' => 43,
+				'hash' => 'hijklmn',
+				'title' => 'Form 2',
+				'expires' => 0,
+				'lastUpdated' => 123456789,
+				'permissions' => ['submit'],
+				'partial' => true,
+				'state' => 0,
+				'lockedBy' => null,
+				'lockedUntil' => null,
+			],
+		];
+
+		$this->assertEquals($expected, $this->formsService->getPartialFormArrays([$ownedForm, $sharedForm]));
 	}
 
 	public static function dataGetPublicForm() {
@@ -1390,6 +1522,20 @@ class FormsServiceTest extends TestCase {
 		$this->assertEquals($expected, $this->formsService->areExtraSettingsValid($extraSettings, $questionType));
 	}
 
+	public function testAreExtraSettingsValidNormalizesLegacyDateLimitsAsUtcDates(): void {
+		$previousTimezone = date_default_timezone_get();
+		date_default_timezone_set('America/Los_Angeles');
+
+		try {
+			$this->assertTrue($this->formsService->areExtraSettingsValid([
+				'dateMin' => 1742860800,
+				'dateMax' => 1742860800,
+			], Constants::ANSWER_TYPE_DATE));
+		} finally {
+			date_default_timezone_set($previousTimezone);
+		}
+	}
+
 	public static function dataAreExtraSettingsValid() {
 		return [
 			'empty-extra-settings' => [
@@ -1528,10 +1674,26 @@ class FormsServiceTest extends TestCase {
 				'questionType' => Constants::ANSWER_TYPE_DATE,
 				'expected' => true
 			],
+			'valid-date-settings-string' => [
+				'extraSettings' => [
+					'dateMin' => '2026-08-20',
+					'dateMax' => '2026-08-25',
+				],
+				'questionType' => Constants::ANSWER_TYPE_DATE,
+				'expected' => true
+			],
 			'invalid-date-settings' => [
 				'extraSettings' => [
 					'dateMin' => 'today',
 					'dateMax2' => null,
+				],
+				'questionType' => Constants::ANSWER_TYPE_DATE,
+				'expected' => false
+			],
+			'invalid-date-settings-overlap' => [
+				'extraSettings' => [
+					'dateMin' => '2026-08-25',
+					'dateMax' => '2026-08-20',
 				],
 				'questionType' => Constants::ANSWER_TYPE_DATE,
 				'expected' => false
@@ -1622,7 +1784,7 @@ class FormsServiceTest extends TestCase {
 		$form->setFileId(100);
 		$form->setOwnerId('user1');
 
-		$folder = $this->createMock(Folder::class);
+		$folder = $this->createUserFolderMock();
 		$folder->expects($this->once())
 			->method('getById')
 			->with(100)

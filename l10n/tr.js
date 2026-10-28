@@ -80,7 +80,7 @@ OC.L10N.register(
     "Grid" : "Izgara",
     "Form closed" : "Form kapatıldı",
     "Expired {relativeDate}" : "Geçerlilik süresi dolmuş {relativeDate}",
-    "Expires {relativeDate}" : "Geçerlilik süresi sonu {relativeDate}",
+    "Expires {relativeDate}" : "Geçerlilik sonu {relativeDate}",
     "Error while deleting {title}" : "{title} ögesi silinirken sorun çıktı",
     "Delete form" : "Formu sil",
     "Are you sure you want to delete {title}?" : "{title} ögesini silmek istediğinize emin misiniz?",
@@ -255,7 +255,7 @@ OC.L10N.register(
     "Remove link" : "Bağlantıyı kaldır",
     "Share {formTitle}" : "{formTitle} formunu paylaş",
     "Internal link" : "İç bağlantı",
-    "Only works for logged in accounts with access rights" : "Yalnızca erişim izni olan oturum açmış kullanıcılar için geçerlidir",
+    "Only works for logged in accounts with access rights" : "Yalnızca erişme izni olan oturum açmış kullanıcılar için geçerlidir",
     "Permit access to all logged in accounts" : "Tüm oturum açmış hesaplara erişim ver",
     "Show to all accounts on sidebar" : "Kenar çubuğunda tüm hesaplara görüntülensin",
     "This form is now owned by" : "Bu formun yeni sahibi",
@@ -364,8 +364,8 @@ OC.L10N.register(
     "This question needs a title and at least one answer!" : "Bu sorunun bir başlığı ve en az bir yanıtı olmalıdır!",
     "Radio buttons" : "Radyo düğmeleri",
     "Radio buttons question title" : "Radyo düğmeleri sorusunun başlığı",
-    "Dropdown" : "Açılan kutu",
-    "Dropdown question title" : "Açılan kutu soru başlığı",
+    "Dropdown" : "Açılan liste",
+    "Dropdown question title" : "Açılan liste soru başlığı",
     "People can pick one option" : "İnsanlar bir seçenek seçebilir",
     "Pick an option" : "Bir seçenek seçin",
     "File" : "Dosya",
@@ -420,7 +420,6 @@ OC.L10N.register(
     "People can enter a number" : "İnsanlar bir sayı yazabilir",
     "Enter a number" : "Bir sayı yazın",
     "Custom regular expression" : "Özel kurallı ifade",
-    "The input does not match the required pattern" : "Yazdığınız bilgi istenilen biçimde değil",
-    "Insert question" : "Soru ekle"
+    "The input does not match the required pattern" : "Yazdığınız bilgi istenilen biçimde değil"
 },
 "nplurals=2; plural=(n > 1);");

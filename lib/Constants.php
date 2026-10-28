@@ -42,6 +42,7 @@ class Constants {
 		self::CONFIG_KEY_ALLOWCONFIRMATIONEMAIL => 'bool',
 		self::CONFIG_KEY_CREATIONALLOWEDGROUPS => 'array',
 		self::CONFIG_KEY_CONFIRMATIONEMAILRATELIMIT => 'int',
+		self::CONFIG_KEY_ALLOWCOMMENTS => 'bool',
 	];
 
 	public const PUBLIC_SHARE_TOKEN_MIN_LENGTH = 1;
@@ -69,6 +70,15 @@ class Constants {
 	public const FORM_STATE_ACTIVE = 0;
 	public const FORM_STATE_CLOSED = 1;
 	public const FORM_STATE_ARCHIVED = 2;
+
+	/**
+	 * Names of the form states, used in the audit log
+	 */
+	public const FORM_STATE_NAMES = [
+		self::FORM_STATE_ACTIVE => 'active',
+		self::FORM_STATE_CLOSED => 'closed',
+		self::FORM_STATE_ARCHIVED => 'archived',
+	];
 
 	/**
 	 * Access flags of a form
@@ -187,8 +197,8 @@ class Constants {
 	];
 
 	public const EXTRA_SETTINGS_DATE = [
-		'dateMax' => ['integer', 'NULL'],
-		'dateMin' => ['integer', 'NULL'],
+		'dateMax' => ['string', 'integer', 'NULL'],
+		'dateMin' => ['string', 'integer', 'NULL'],
 		'dateRange' => ['boolean', 'NULL'],
 	];
 
